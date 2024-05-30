@@ -1,5 +1,4 @@
-/*
- * QuickJS Javascript Engine
+/* QuickJS Javascript Engine
  *
  * Copyright (c) 2017-2021 Fabrice Bellard
  * Copyright (c) 2017-2021 Charlie Gordon
@@ -46,6 +45,7 @@ extern "C" {
 #endif
 
 #define JS_BOOL int
+#define DEFAULT_ID -1
 
 typedef struct JSRuntime JSRuntime;
 typedef struct JSContext JSContext;
@@ -321,6 +321,7 @@ JS_EXTERN void JS_FreeContext(JSContext *s);
 JS_EXTERN JSContext *JS_DupContext(JSContext *ctx);
 JS_EXTERN void *JS_GetContextOpaque(JSContext *ctx);
 JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
+JS_EXTERN void JS_SetErrorMessageForCodegen(JSContext *ctx, const char* error);
 JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);
 JS_EXTERN void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
 JS_EXTERN JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);
@@ -581,6 +582,7 @@ JS_EXTERN JS_BOOL JS_IsError(JSContext *ctx, JSValue val);
 JS_EXTERN void JS_ResetUncatchableError(JSContext *ctx);
 JS_EXTERN JSValue JS_NewError(JSContext *ctx);
 JS_EXTERN JSValue __js_printf_like(2, 3) JS_ThrowPlainError(JSContext *ctx, const char *fmt, ...);
+JS_EXTERN JSValue __js_printf_like(2, 3) JS_ThrowEvalError(JSContext *ctx, const char *fmt, ...);
 JS_EXTERN JSValue __js_printf_like(2, 3) JS_ThrowSyntaxError(JSContext *ctx, const char *fmt, ...);
 JS_EXTERN JSValue __js_printf_like(2, 3) JS_ThrowTypeError(JSContext *ctx, const char *fmt, ...);
 JS_EXTERN JSValue __js_printf_like(2, 3) JS_ThrowReferenceError(JSContext *ctx, const char *fmt, ...);
@@ -725,10 +727,14 @@ JS_EXTERN JS_BOOL JS_DetectModule(const char *input, size_t input_len);
 /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
 JS_EXTERN JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
                           const char *filename, int eval_flags);
+JS_EXTERN JSValue JS_CompileScript(JSContext *ctx, const char *input,
+                                   size_t input_len, const char *filename);
+JS_EXTERN JSValue JS_CompileModule(JSContext *ctx, const char *input,
+                                   size_t input_len, const char *filename, int id);
 /* same as JS_Eval() but with an explicit 'this_obj' parameter */
 JS_EXTERN JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
-                              const char *input, size_t input_len,
-                              const char *filename, int eval_flags);
+                    const char *input, size_t input_len,
+                    const char *filename, int id, int eval_flags);
 JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
 JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValue val, JSValue obj);
 JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValue this_obj,
@@ -816,6 +822,7 @@ JS_EXTERN void JS_SetModuleLoaderFunc(JSRuntime *rt,
 /* return the import.meta object of a module */
 JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
 JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
+JS_EXTERN int JS_GetModuleId(JSModuleDef *m);
 JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
 
 /* JS Job support */
@@ -851,6 +858,7 @@ JS_EXTERN int JS_ResolveModule(JSContext *ctx, JSValue obj);
 
 /* only exported for os.Worker() */
 JS_EXTERN JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
+JS_EXTERN int JS_GetScriptOrModuleId(JSContext *ctx, int n_stack_levels);
 /* only exported for os.Worker() */
 JS_EXTERN JSModuleDef *JS_RunModule(JSContext *ctx, const char *basename,
                                     const char *filename);

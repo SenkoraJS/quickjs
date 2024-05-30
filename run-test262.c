@@ -85,6 +85,7 @@ int update_errors;
 int test_count, test_failed, test_index, test_skipped, test_excluded;
 int new_errors, changed_errors, fixed_errors;
 int async_done;
+static int module_ids = 1;
 
 void warning(const char *, ...) __attribute__((__format__(__printf__, 1, 2)));
 void fatal(int, const char *, ...) __attribute__((__format__(__printf__, 2, 3)));
@@ -842,8 +843,7 @@ static JSModuleDef *js_module_loader_test(JSContext *ctx,
     }
 
     /* compile the module */
-    func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    func_val = JS_CompileModule(ctx, (char *)buf, buf_len, module_name, module_ids++);
     js_free(ctx, buf);
     if (JS_IsException(func_val))
         return NULL;

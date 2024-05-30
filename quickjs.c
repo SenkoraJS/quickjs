@@ -411,8 +411,9 @@ struct JSContext {
     /* if NULL, eval is not supported */
     JSValue (*eval_internal)(JSContext *ctx, JSValue this_obj,
                              const char *input, size_t input_len,
-                             const char *filename, int flags, int scope_idx);
+                             const char *filename, int id, int flags, int scope_idx);
     void *user_opaque;
+    char *eval_error_msg;
 };
 
 typedef union JSFloat64Union {
@@ -656,6 +657,8 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+
+    int id; /* for module searching */
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -793,6 +796,8 @@ struct JSModuleDef {
     BOOL eval_has_exception : 8;
     JSValue eval_exception;
     JSValue meta_obj; /* for import.meta */
+
+    int id; /* search for a module using id instead */
 };
 
 typedef struct JSJobEntry {
@@ -1181,7 +1186,7 @@ static void js_async_function_resolve_mark(JSRuntime *rt, JSValue val,
                                            JS_MarkFunc *mark_func);
 static JSValue JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                const char *input, size_t input_len,
-                               const char *filename, int flags, int scope_idx);
+                               const char *filename, int id, int flags, int scope_idx);
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
 static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                JS_MarkFunc *mark_func);
@@ -2119,6 +2124,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->error_ctor = JS_NULL;
     ctx->error_prepare_stack = JS_UNDEFINED;
     ctx->error_stack_trace_limit = 10;
+    ctx->eval_error_msg = NULL;
     init_list_head(&ctx->loaded_modules);
 
     JS_AddIntrinsicBasicObjects(ctx);
@@ -2153,6 +2159,12 @@ JSContext *JS_NewContext(JSRuntime *rt)
 void *JS_GetContextOpaque(JSContext *ctx)
 {
     return ctx->user_opaque;
+}
+
+void JS_SetErrorMessageForCodegen(JSContext *ctx, const char* error)
+{
+    if (error == NULL) return;
+    ctx->eval_error_msg = js_strdup(ctx, error);
 }
 
 void JS_SetContextOpaque(JSContext *ctx, void *opaque)
@@ -2315,6 +2327,7 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->regexp_ctor);
     JS_FreeValue(ctx, ctx->function_ctor);
     JS_FreeValue(ctx, ctx->function_proto);
+    js_free(ctx, ctx->eval_error_msg);
 
     js_free_shape_null(ctx->rt, ctx->array_shape);
 
@@ -6738,6 +6751,17 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowRangeError(JSContext *ctx,
 
     va_start(ap, fmt);
     val = JS_ThrowError(ctx, JS_RANGE_ERROR, fmt, ap);
+    va_end(ap);
+    return val;
+}
+
+JSValue __attribute__((format(printf, 2, 3))) JS_ThrowEvalError(JSContext *ctx, const char *fmt, ...)
+{
+    JSValue val;
+    va_list ap;
+
+    va_start(ap, fmt);
+    val = JS_ThrowError(ctx, JS_EVAL_ERROR, fmt, ap);
     va_end(ap);
     return val;
 }
@@ -15167,11 +15191,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
                         obj = call_argv[0];
                     else
                         obj = JS_UNDEFINED;
-                    ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj,
-                                            JS_EVAL_TYPE_DIRECT, scope_idx);
+
+                    if (ctx->eval_error_msg != NULL) {
+                        ret_val = JS_ThrowEvalError(ctx, "%s", ctx->eval_error_msg);
+                    } else {
+                        ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj,
+                                                JS_EVAL_TYPE_DIRECT, scope_idx);
+                    }
                 } else {
-                    ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
-                                              JS_UNDEFINED, call_argc, call_argv, 0);
+                    if (ctx->eval_error_msg != NULL) {
+                        ret_val = JS_ThrowEvalError(ctx, "%s", ctx->eval_error_msg);
+                    } else {
+                        ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+                                                  JS_UNDEFINED, call_argc, call_argv, 0);
+                    }
                 }
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
@@ -25666,6 +25699,28 @@ static JSModuleDef *js_new_module_def(JSContext *ctx, JSAtom name)
     m->func_obj = JS_UNDEFINED;
     m->eval_exception = JS_UNDEFINED;
     m->meta_obj = JS_UNDEFINED;
+    m->id = -1;
+    list_add_tail(&m->link, &ctx->loaded_modules);
+    return m;
+}
+
+/* 'name' is freed */
+static JSModuleDef *js_new_module_def2(JSContext *ctx, JSAtom name, int id)
+{
+    JSModuleDef *m;
+    m = js_mallocz(ctx, sizeof(*m));
+    if (!m) {
+        JS_FreeAtom(ctx, name);
+        return NULL;
+    }
+    m->header.ref_count = 1;
+    m->module_name = name;
+    m->promise = JS_UNDEFINED;
+    m->module_ns = JS_UNDEFINED;
+    m->func_obj = JS_UNDEFINED;
+    m->eval_exception = JS_UNDEFINED;
+    m->meta_obj = JS_UNDEFINED;
+    m->id = id;
     list_add_tail(&m->link, &ctx->loaded_modules);
     return m;
 }
@@ -25933,6 +25988,7 @@ static char *js_default_module_normalize_name(JSContext *ctx,
             break;
         }
     }
+
     if (filename[0] != '\0')
         pstrcat(filename, cap, "/");
     pstrcat(filename, cap, r);
@@ -25940,7 +25996,7 @@ static char *js_default_module_normalize_name(JSContext *ctx,
     return filename;
 }
 
-static JSModuleDef *js_find_loaded_module(JSContext *ctx, JSAtom name)
+static JSModuleDef *js_find_loaded_module(JSContext *ctx, int id)
 {
     struct list_head *el;
     JSModuleDef *m;
@@ -25948,7 +26004,7 @@ static JSModuleDef *js_find_loaded_module(JSContext *ctx, JSAtom name)
     /* first look at the loaded modules */
     list_for_each(el, &ctx->loaded_modules) {
         m = list_entry(el, JSModuleDef, link);
-        if (m->module_name == name)
+        if (m->id == id)
             return m;
     }
     return NULL;
@@ -25978,14 +26034,6 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     if (module_name == JS_ATOM_NULL) {
         js_free(ctx, cname);
         return NULL;
-    }
-
-    /* first look at the loaded modules */
-    m = js_find_loaded_module(ctx, module_name);
-    if (m) {
-        js_free(ctx, cname);
-        JS_FreeAtom(ctx, module_name);
-        return m;
     }
 
     JS_FreeAtom(ctx, module_name);
@@ -26516,6 +26564,7 @@ static int js_create_module_bytecode_function(JSContext *ctx, JSModuleDef *m)
     p = JS_VALUE_GET_OBJ(func_obj);
     p->u.func.function_bytecode = b;
     b->header.ref_count++;
+    b->id = m->id;
     p->u.func.home_object = NULL;
     p->u.func.var_refs = NULL;
     if (b->closure_var_count) {
@@ -26751,6 +26800,33 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
 
 /* return JS_ATOM_NULL if the name cannot be found. Only works with
    not striped bytecode functions. */
+int JS_GetScriptOrModuleId(JSContext *ctx, int n_stack_levels)
+{
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+    JSObject *p;
+    /* XXX: currently we just use the filename of the englobing
+       function. It does not work for eval(). Need to add a
+       ScriptOrModule info in JSFunctionBytecode */
+    sf = ctx->rt->current_stack_frame;
+    if (!sf)
+        return JS_ATOM_NULL;
+    while (n_stack_levels-- > 0) {
+        sf = sf->prev_frame;
+        if (!sf)
+            return JS_ATOM_NULL;
+    }
+    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return JS_ATOM_NULL;
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id))
+        return JS_ATOM_NULL;
+    b = p->u.func.function_bytecode;
+    return b->id;
+}
+
+/* return JS_ATOM_NULL if the name cannot be found. Only works with
+   not striped bytecode functions. */
 JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
 {
     JSStackFrame *sf;
@@ -26781,6 +26857,11 @@ JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m)
     return JS_DupAtom(ctx, m->module_name);
 }
 
+int JS_GetModuleId(JSModuleDef *m)
+{
+    return m->id;
+}
+
 JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
 {
     JSValue obj;
@@ -26797,17 +26878,16 @@ JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
 
 static JSValue js_import_meta(JSContext *ctx)
 {
-    JSAtom filename;
+    int id;
     JSModuleDef *m;
 
-    filename = JS_GetScriptOrModuleName(ctx, 0);
-    if (filename == JS_ATOM_NULL)
+    id = JS_GetScriptOrModuleId(ctx, 0);
+    if (id == -1)
         goto fail;
 
     /* XXX: inefficient, need to add a module or script pointer in
        JSFunctionBytecode */
-    m = js_find_loaded_module(ctx, filename);
-    JS_FreeAtom(ctx, filename);
+    m = js_find_loaded_module(ctx, id);
     if (!m) {
     fail:
         JS_ThrowTypeError(ctx, "import.meta not supported in this context");
@@ -32367,7 +32447,7 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 /* `export_name` and `input` may be pure ASCII or UTF-8 encoded */
 static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                  const char *input, size_t input_len,
-                                 const char *filename, int flags, int scope_idx)
+                                 const char *filename, int id, int flags, int scope_idx)
 {
     JSParseState s1, *s = &s1;
     int err, js_mode, eval_type;
@@ -32404,7 +32484,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
             JSAtom module_name = JS_NewAtom(ctx, filename);
             if (module_name == JS_ATOM_NULL)
                 return JS_EXCEPTION;
-            m = js_new_module_def(ctx, module_name);
+            m = js_new_module_def2(ctx, module_name, id);
             if (!m)
                 return JS_EXCEPTION;
             js_mode |= JS_MODE_STRICT;
@@ -32480,12 +32560,12 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
 /* the indirection is needed to make 'eval' optional */
 static JSValue JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                const char *input, size_t input_len,
-                               const char *filename, int flags, int scope_idx)
+                               const char *filename, int id, int flags, int scope_idx)
 {
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
-    return ctx->eval_internal(ctx, this_obj, input, input_len, filename,
+    return ctx->eval_internal(ctx, this_obj, input, input_len, filename, id,
                               flags, scope_idx);
 }
 
@@ -32501,7 +32581,7 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValue this_obj,
     str = JS_ToCStringLen(ctx, &len, val);
     if (!str)
         return JS_EXCEPTION;
-    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", flags, scope_idx);
+    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", DEFAULT_ID, flags, scope_idx);
     JS_FreeCString(ctx, str);
     return ret;
 
@@ -32509,14 +32589,14 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValue this_obj,
 
 JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
                     const char *input, size_t input_len,
-                    const char *filename, int eval_flags)
+                    const char *filename, int id, int eval_flags)
 {
     int eval_type = eval_flags & JS_EVAL_TYPE_MASK;
     JSValue ret;
 
     assert(eval_type == JS_EVAL_TYPE_GLOBAL ||
            eval_type == JS_EVAL_TYPE_MODULE);
-    ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename,
+    ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename, id,
                           eval_flags, -1);
     return ret;
 }
@@ -32524,8 +32604,22 @@ JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
 JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
                 const char *filename, int eval_flags)
 {
-    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename,
+    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename, DEFAULT_ID,
                        eval_flags);
+}
+
+JSValue JS_CompileScript(JSContext *ctx, const char *input,
+                         size_t input_len, const char *filename)
+{
+    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename, DEFAULT_ID,
+                       JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+}
+
+JSValue JS_CompileModule(JSContext *ctx, const char *input,
+                         size_t input_len, const char *filename, int id)
+{
+    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename, id,
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
 }
 
 int JS_ResolveModule(JSContext *ctx, JSValue obj)
@@ -36377,6 +36471,12 @@ static JSValue js_function_constructor(JSContext *ctx, JSValue new_target,
         if (ret < 0)
             goto fail1;
     }
+
+    if (ctx->eval_error_msg != NULL) {
+        JS_ThrowEvalError(ctx, "%s", ctx->eval_error_msg);
+        goto fail1;
+    }
+
     return obj;
 
  fail:

@@ -156,6 +156,7 @@ typedef struct JSThreadState {
 
 static uint64_t os_pending_signals;
 static int (*os_poll_func)(JSContext *ctx);
+static int module_ids = 1;
 
 static void js_std_dbuf_init(JSContext *ctx, DynBuf *s)
 {
@@ -448,8 +449,7 @@ static JSValue js_loadScript(JSContext *ctx, JSValue this_val,
         JS_FreeCString(ctx, filename);
         return JS_EXCEPTION;
     }
-    ret = JS_Eval(ctx, (char *)buf, buf_len, filename,
-                  JS_EVAL_TYPE_GLOBAL);
+    ret = JS_Eval(ctx, (char *)buf, buf_len, filename, JS_EVAL_TYPE_GLOBAL);
     js_free(ctx, buf);
     JS_FreeCString(ctx, filename);
     return ret;
@@ -603,16 +603,22 @@ JSModuleDef *js_module_loader(JSContext *ctx,
         uint8_t *buf;
         JSValue func_val;
 
+        if (strcmp(module_name, "std") == 0) {
+            return js_init_module_std(ctx, "std");
+        }
+
+        if (strcmp(module_name, "os") == 0) {
+            return js_init_module_os(ctx, "os");
+        }
+
         buf = js_load_file(ctx, &buf_len, module_name);
         if (!buf) {
             JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
                                    module_name);
             return NULL;
         }
-
         /* compile the module */
-        func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        func_val = JS_CompileModule(ctx, (char *)buf, buf_len, module_name, module_ids++);
         js_free(ctx, buf);
         if (JS_IsException(func_val))
             return NULL;

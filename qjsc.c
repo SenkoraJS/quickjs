@@ -57,6 +57,7 @@ static namelist_t init_module_list;
 static FILE *outfile;
 static const char *c_ident_prefix = "qjsc_";
 static int strip;
+static int module_ids = 1;
 
 void namelist_add(namelist_t *lp, const char *name, const char *short_name,
                   int flags)
@@ -241,8 +242,7 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
         }
 
         /* compile the module */
-        func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        func_val = JS_CompileModule(ctx, (char *)buf, buf_len, module_name, module_ids++);
         js_free(ctx, buf);
         if (JS_IsException(func_val))
             return NULL;
@@ -284,7 +284,10 @@ static void compile_file(JSContext *ctx, FILE *fo,
         eval_flags |= JS_EVAL_TYPE_MODULE;
     else
         eval_flags |= JS_EVAL_TYPE_GLOBAL;
-    obj = JS_Eval(ctx, (const char *)buf, buf_len, filename, eval_flags);
+    if (module)
+        obj = JS_CompileModule(ctx, (const char *)buf, buf_len, filename, module_ids++);
+    else
+        obj = JS_CompileScript(ctx, (const char *)buf, buf_len, filename);
     if (JS_IsException(obj)) {
         js_std_dump_error(ctx);
         exit(1);
